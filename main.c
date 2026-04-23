@@ -13,15 +13,19 @@
 #include <utime.h>
 #include <fcntl.h>
 #include <dirent.h>
+#include <sys/mman.h>
 
 typedef enum file_type
 {
+  FT_NONE,
   FT_DIRECTORY,
   FT_REGULAR,
   FT_OTHER
 } file_type;
 
 #define PATH_MAX_P 200
+#define DEFAULT_MMAP_THRESHOLD (512 * 1024)
+
 volatile sig_atomic_t wakeup = 0;
 
 char global_buffer[2048];
@@ -62,10 +66,10 @@ void Demonize(){
   close(STDERR_FILENO);
 }
 
-bool get_file_type(const char *path){
+file_type get_file_type(const char *path){
   struct stat st;
   if(stat(path, &st) != 0)
-    return false;
+    return FT_NONE;
   if(S_ISDIR(st.st_mode))
     return FT_DIRECTORY;
   if(S_ISREG(st.st_mode))
@@ -113,13 +117,13 @@ void copy_file(const char *src, const char *dst){
   src_file = open(src, O_RDONLY);
   if(src_file == -1){
     snprintf(global_buffer, sizeof(global_buffer), "Could not open source file at path during copying: %s", src);
-    msg(global_buffer);
+    syslog(LOG_INFO, "%s", global_buffer);
     return;
   }
   dst_file = open(dst, O_WRONLY | O_TRUNC | O_CREAT, 0644);
   if(dst_file == -1){
     snprintf(global_buffer, sizeof(global_buffer), "Could not open destiantion file at path during copying: %s", dst);
-    msg(global_buffer);
+    syslog(LOG_INFO, "%s", global_buffer);
     close(src_file);
     return;
   }
@@ -135,7 +139,7 @@ void copy_file(const char *src, const char *dst){
       close(dst_file);
       free(buffer);
       snprintf(global_buffer, sizeof(global_buffer), "Error ocured during copying file from %s to %s", src, dst);
-      msg(global_buffer);
+      syslog(LOG_INFO, "%s", global_buffer);
       return;
     }
   }
@@ -144,23 +148,23 @@ void copy_file(const char *src, const char *dst){
   close(dst_file);
   free(buffer);
   snprintf(global_buffer, sizeof(global_buffer), "Succesfully copied file from %s to %s", src, dst);
-  msg(global_buffer);
+  syslog(LOG_INFO, "%s", global_buffer);
   return;
 }
 
 void copy_directory(const char *src, const char *dst){
   if(mkdir(dst, 0755) != 0){
     snprintf(global_buffer, sizeof(global_buffer), "Could not crate directory at %s", dst);
-    msg(global_buffer);
+    syslog(LOG_INFO, "%s", global_buffer);
     return;
   }
   snprintf(global_buffer, sizeof(global_buffer), "Directory created at %s", dst);
-  msg(global_buffer);
+  syslog(LOG_INFO, "%s", global_buffer);
 
   DIR *src_directory = opendir(src);
   if(src_directory == NULL){
     snprintf(global_buffer, sizeof(global_buffer), "Failed opening diresctory %s", src);
-    msg(global_buffer);
+    syslog(LOG_INFO, "%s", global_buffer);
     return;
   }
 
@@ -205,13 +209,13 @@ int remove_directory(const char *path)
             return res;
           }
           snprintf(global_buffer, sizeof(global_buffer), "Directory removed: %s", ent_path);
-          msg(global_buffer);
+          syslog(LOG_INFO, "%s", global_buffer);
         }
         break;
       case DT_REG:
         if (remove(ent_path) == 0) {
           snprintf(global_buffer, sizeof(global_buffer), "File removed: %s", ent_path);
-          msg(global_buffer);
+          syslog(LOG_INFO, "%s", global_buffer);
         }
         else
         {
@@ -221,7 +225,7 @@ int remove_directory(const char *path)
         break;
       default:
         snprintf(global_buffer, sizeof(global_buffer), "Unsupported item type: %s", ent_path);
-        msg(global_buffer);
+        syslog(LOG_INFO, "%s", global_buffer);
         closedir(dir);
         return -2;
     }
@@ -231,11 +235,186 @@ int remove_directory(const char *path)
     return -3;
   
   snprintf(global_buffer, sizeof(global_buffer), "Directory removed: %s", path);
-  msg(global_buffer);
+  syslog(LOG_INFO, "%s", global_buffer);
 
   return 0;
 }
 
+static void copy_file_smart(const char *src, const char *dst, off_t threshold)
+{
+    struct stat st;
+    if (stat(src, &st) != 0) {
+        snprintf(global_buffer, sizeof(global_buffer),
+                 "stat failed: %s", src);
+        syslog(LOG_ERR, "%s", global_buffer);
+        return;
+    }
+
+    int src_fd = open(src, O_RDONLY);
+    if (src_fd == -1) {
+        snprintf(global_buffer, sizeof(global_buffer),
+                 "Cannot open source: %s", src);
+        syslog(LOG_ERR, "%s", global_buffer);
+        return;
+    }
+
+    int dst_fd = open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (dst_fd == -1) {
+        snprintf(global_buffer, sizeof(global_buffer),
+                 "Cannot open destination: %s", dst);
+        syslog(LOG_ERR, "%s", global_buffer);
+        close(src_fd);
+        return;
+    }
+
+    int ok;
+    if (st.st_size > threshold) {
+        void *mapped = mmap(NULL, (size_t)st.st_size, PROT_READ,
+                            MAP_PRIVATE, src_fd, 0);
+        if (mapped == MAP_FAILED) {
+            syslog(LOG_ERR, "mmap failed: %s", src);
+            close(src_fd); close(dst_fd);
+            return;
+        }
+        ok = (write(dst_fd, mapped, (size_t)st.st_size) == st.st_size);
+        munmap(mapped, (size_t)st.st_size);
+        if (ok)
+            syslog(LOG_INFO, "Copied (mmap): %s -> %s", src, dst);
+        else
+            syslog(LOG_ERR, "mmap write incomplete: %s -> %s", src, dst);
+    } else {
+        char buf[16384];
+        ssize_t n;
+        ok = 1;
+        while ((n = read(src_fd, buf, sizeof(buf))) > 0) {
+            if (write(dst_fd, buf, (size_t)n) != n) {
+                ok = 0;
+                break;
+            }
+        }
+        if (n < 0) ok = 0;
+        if (ok)
+            syslog(LOG_INFO, "Copied (read/write): %s -> %s", src, dst);
+        else
+            syslog(LOG_ERR, "Copy failed: %s -> %s", src, dst);
+    }
+
+    if (ok) {
+        struct timespec times[2] = { st.st_atim, st.st_mtim };
+        if (futimens(dst_fd, times) != 0)
+            syslog(LOG_ERR, "futimens failed: %s", dst);
+    }
+
+    close(src_fd);
+    close(dst_fd);
+}
+
+static void remove_file(const char *path)
+{
+    if (unlink(path) == 0)
+        syslog(LOG_INFO, "Removed file: %s", path);
+    else
+        syslog(LOG_ERR, "Failed to remove file: %s", path);
+}
+
+static void compare_dirs(const char *src, const char *dst,
+                         bool recursive, off_t threshold)
+{
+    DIR *src_dir = opendir(src);
+    if (!src_dir) {
+        syslog(LOG_ERR, "Cannot open source dir: %s", src);
+        return;
+    }
+
+    struct dirent *ent;
+    while ((ent = readdir(src_dir)) != NULL) {
+        if (strcmp(ent->d_name, ".") == 0 ||
+            strcmp(ent->d_name, "..") == 0) continue;
+
+        char src_path[PATH_MAX], dst_path[PATH_MAX];
+        snprintf(src_path, sizeof(src_path), "%s/%s", src, ent->d_name);
+        snprintf(dst_path, sizeof(dst_path), "%s/%s", dst, ent->d_name);
+
+        struct stat src_st;
+        if (lstat(src_path, &src_st) != 0) continue;
+
+        if (S_ISREG(src_st.st_mode)) {
+            struct stat dst_st;
+            bool dst_exists = (lstat(dst_path, &dst_st) == 0 &&
+                                S_ISREG(dst_st.st_mode));
+
+            if (!dst_exists) {
+                syslog(LOG_INFO, "New file: %s", src_path);
+                copy_file_smart(src_path, dst_path, threshold);
+            } else if (src_st.st_mtime > dst_st.st_mtime) {
+                syslog(LOG_INFO, "Updated file: %s", src_path);
+                copy_file_smart(src_path, dst_path, threshold);
+            }
+
+        } else if (S_ISDIR(src_st.st_mode) && recursive) {
+            struct stat dst_st;
+            if (lstat(dst_path, &dst_st) != 0) {
+                if (mkdir(dst_path, 0755) == 0)
+                    syslog(LOG_INFO, "Created dir: %s", dst_path);
+                else {
+                    syslog(LOG_ERR, "mkdir failed: %s", dst_path);
+                    continue;
+                }
+            }
+            compare_dirs(src_path, dst_path, true, threshold);
+        }
+    }
+    closedir(src_dir);
+}
+
+static void remove_extras(const char *src, const char *dst, bool recursive)
+{
+    DIR *dst_dir = opendir(dst);
+    if (!dst_dir) {
+        syslog(LOG_ERR, "Cannot open dest dir: %s", dst);
+        return;
+    }
+
+    struct dirent *ent;
+    while ((ent = readdir(dst_dir)) != NULL) {
+        if (strcmp(ent->d_name, ".") == 0 ||
+            strcmp(ent->d_name, "..") == 0) continue;
+
+        char src_path[PATH_MAX], dst_path[PATH_MAX];
+        snprintf(src_path, sizeof(src_path), "%s/%s", src, ent->d_name);
+        snprintf(dst_path, sizeof(dst_path), "%s/%s", dst, ent->d_name);
+
+        struct stat src_st;
+        bool in_src = (lstat(src_path, &src_st) == 0);
+
+        struct stat dst_st;
+        if (lstat(dst_path, &dst_st) != 0) continue;
+
+        if (S_ISREG(dst_st.st_mode)) {
+            if (!in_src || !S_ISREG(src_st.st_mode))
+                remove_file(dst_path);
+        } else if (S_ISDIR(dst_st.st_mode) && recursive) {
+            if (!in_src || !S_ISDIR(src_st.st_mode)) {
+                if (remove_directory(dst_path) == 0)
+                    syslog(LOG_INFO, "Removed dir: %s", dst_path);
+                else
+                    syslog(LOG_ERR, "Failed to remove dir: %s", dst_path);
+            } else {
+                remove_extras(src_path, dst_path, true);
+            }
+        }
+    }
+    closedir(dst_dir);
+}
+
+void sync_dirs(const char *src, const char *dst,
+               bool recursive, off_t threshold)
+{
+    syslog(LOG_INFO, "Sync started: %s -> %s", src, dst);
+    remove_extras(src, dst, recursive);
+    compare_dirs(src, dst, recursive, threshold);
+    syslog(LOG_INFO, "Sync finished: %s -> %s", src, dst);
+}
 
 int main(int _argc, char** _argv){
   if(_argc < 3){
@@ -249,6 +428,7 @@ int main(int _argc, char** _argv){
   
   uint32_t tSleep = 5 * 60;
   bool recursive = false;
+  off_t mmap_threshold = DEFAULT_MMAP_THRESHOLD;
   
   for(int i=3; i<_argc; i++){
     if(_argv[i][0] != '-' || strlen(_argv[i]) != 2){
@@ -263,15 +443,19 @@ int main(int _argc, char** _argv){
       }
       tSleep = atoi(_argv[i]);
     }
+    else if(_argv[i][1] == 'm'){
+       if(++i >= _argc){ pUse(); return -1; }
+          mmap_threshold = (off_t)atol(_argv[i]);
+       }
   }
   if(tSleep < 10) tSleep = 10;
   
-  if(get_file_type(src) == FT_DIRECTORY){
+  if(get_file_type(src) != FT_DIRECTORY){
     msg("Source directory does not exist or is not a directory");
     return -1;
   }
 
-  if(!get_file_type(dst) == FT_DIRECTORY){
+  if(get_file_type(dst) != FT_DIRECTORY){
     msg("Destination directory does not exist or is not a directory");
     return -1;
   }
@@ -305,7 +489,7 @@ int main(int _argc, char** _argv){
       syslog(LOG_INFO, "Woke up naturally");
     }
 
-    //wywołajcie funkcję sync z argumentami path, recursive 
+    sync_dirs(src, dst, recursive, mmap_threshold); 
   }
 
   syslog(LOG_NOTICE, "Sync daemon terminated\n");
