@@ -110,9 +110,16 @@ void msg(const char *message){
   return;
 }
 
-void copy_file(const char *src, const char *dst){
+void copy_file(const char *src, const char *dst, bool use_mmap){
   int src_file, dst_file;
   ssize_t b_read, b_written;
+
+  struct stat st;
+  if(stat(src, &st) != 0){
+    snprintf(global_buffer, sizeof(global_buffer), "Could not stat source file: %s", src);
+    syslog(LOG_ERR, "%s", global_buffer);
+    return;
+  }
 
   src_file = open(src, O_RDONLY);
   if(src_file == -1){
@@ -125,6 +132,25 @@ void copy_file(const char *src, const char *dst){
     snprintf(global_buffer, sizeof(global_buffer), "Could not open destiantion file at path during copying: %s", dst);
     syslog(LOG_INFO, "%s", global_buffer);
     close(src_file);
+    return;
+  }
+
+  if(use_mmap){
+    void *mapped = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, src_file, 0);
+
+    if(mapped == MAP_FAILED){
+      syslog(LOG_ERR, "mmap failed: %s", src);
+      close(src_file);
+      close(dst_file);
+      return;
+    }
+    write(dst_file, mapped, (size_t)st.st_size);
+    munmap(mapped, (size_t)st.st_size);
+    syslog(LOG_INFO, "Copied (mmap): %s -> %s", src, dst);
+    struct timespec times[2] = {st.st_atim, st.st_mtim};
+    futimens(dst_file, times);
+    close(src_file);
+    close(dst_file);
     return;
   }
 
@@ -149,6 +175,8 @@ void copy_file(const char *src, const char *dst){
   free(buffer);
   snprintf(global_buffer, sizeof(global_buffer), "Succesfully copied file from %s to %s", src, dst);
   syslog(LOG_INFO, "%s", global_buffer);
+  struct timespec times[2] = {st.st_atim, st.st_mtim};
+  futimens(dst_file, times);
   return;
 }
 
@@ -180,7 +208,7 @@ void copy_directory(const char *src, const char *dst){
     if (src_entry->d_type == DT_DIR)
       copy_directory(src_entry_path, dst_entry_path);
     else if (src_entry->d_type == DT_REG)
-      copy_file(src_entry_path, dst_entry_path);
+      copy_file(src_entry_path, dst_entry_path, false);
   }
   closedir(src_directory);
 }
@@ -240,180 +268,109 @@ int remove_directory(const char *path)
   return 0;
 }
 
-static void copy_file_smart(const char *src, const char *dst, off_t threshold)
-{
-    struct stat st;
-    if (stat(src, &st) != 0) {
-        snprintf(global_buffer, sizeof(global_buffer),
-                 "stat failed: %s", src);
-        syslog(LOG_ERR, "%s", global_buffer);
-        return;
-    }
-
-    int src_fd = open(src, O_RDONLY);
-    if (src_fd == -1) {
-        snprintf(global_buffer, sizeof(global_buffer),
-                 "Cannot open source: %s", src);
-        syslog(LOG_ERR, "%s", global_buffer);
-        return;
-    }
-
-    int dst_fd = open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (dst_fd == -1) {
-        snprintf(global_buffer, sizeof(global_buffer),
-                 "Cannot open destination: %s", dst);
-        syslog(LOG_ERR, "%s", global_buffer);
-        close(src_fd);
-        return;
-    }
-
-    int ok;
-    if (st.st_size > threshold) {
-        void *mapped = mmap(NULL, (size_t)st.st_size, PROT_READ,
-                            MAP_PRIVATE, src_fd, 0);
-        if (mapped == MAP_FAILED) {
-            syslog(LOG_ERR, "mmap failed: %s", src);
-            close(src_fd); close(dst_fd);
-            return;
-        }
-        ok = (write(dst_fd, mapped, (size_t)st.st_size) == st.st_size);
-        munmap(mapped, (size_t)st.st_size);
-        if (ok)
-            syslog(LOG_INFO, "Copied (mmap): %s -> %s", src, dst);
-        else
-            syslog(LOG_ERR, "mmap write incomplete: %s -> %s", src, dst);
-    } else {
-        char buf[16384];
-        ssize_t n;
-        ok = 1;
-        while ((n = read(src_fd, buf, sizeof(buf))) > 0) {
-            if (write(dst_fd, buf, (size_t)n) != n) {
-                ok = 0;
-                break;
-            }
-        }
-        if (n < 0) ok = 0;
-        if (ok)
-            syslog(LOG_INFO, "Copied (read/write): %s -> %s", src, dst);
-        else
-            syslog(LOG_ERR, "Copy failed: %s -> %s", src, dst);
-    }
-
-    if (ok) {
-        struct timespec times[2] = { st.st_atim, st.st_mtim };
-        if (futimens(dst_fd, times) != 0)
-            syslog(LOG_ERR, "futimens failed: %s", dst);
-    }
-
-    close(src_fd);
-    close(dst_fd);
-}
-
 static void remove_file(const char *path)
 {
     if (unlink(path) == 0)
-        syslog(LOG_INFO, "Removed file: %s", path);
+      syslog(LOG_INFO, "Removed file: %s", path);
     else
-        syslog(LOG_ERR, "Failed to remove file: %s", path);
+      syslog(LOG_ERR, "Failed to remove file: %s", path);
 }
 
 static void compare_dirs(const char *src, const char *dst,
                          bool recursive, off_t threshold)
 {
-    DIR *src_dir = opendir(src);
-    if (!src_dir) {
-        syslog(LOG_ERR, "Cannot open source dir: %s", src);
-        return;
+  DIR *src_dir = opendir(src);
+  if (!src_dir) {
+    syslog(LOG_ERR, "Cannot open source dir: %s", src);
+    return;
+  }
+
+  struct dirent *ent;
+  while ((ent = readdir(src_dir)) != NULL) {
+    if (strcmp(ent->d_name, ".") == 0 ||
+      strcmp(ent->d_name, "..") == 0) continue;
+
+    char src_path[PATH_MAX], dst_path[PATH_MAX];
+    snprintf(src_path, sizeof(src_path), "%s/%s", src, ent->d_name);
+    snprintf(dst_path, sizeof(dst_path), "%s/%s", dst, ent->d_name);
+
+    struct stat src_st;
+    if (lstat(src_path, &src_st) != 0) continue;
+
+    if (S_ISREG(src_st.st_mode)) {
+      struct stat dst_st;
+      bool dst_exists = (lstat(dst_path, &dst_st) == 0 && S_ISREG(dst_st.st_mode));
+
+      if (!dst_exists) {
+        syslog(LOG_INFO, "New file: %s", src_path);
+        copy_file(src_path, dst_path, src_st.st_size > threshold);
+      } 
+      else if (src_st.st_mtime > dst_st.st_mtime) {
+        syslog(LOG_INFO, "Updated file: %s", src_path);
+        copy_file(src_path, dst_path, src_st.st_size > threshold);
+      }
+
+      } 
+    else if (S_ISDIR(src_st.st_mode) && recursive) {
+      struct stat dst_st;
+      if (lstat(dst_path, &dst_st) != 0) {
+        copy_directory(src_path, dst_path);
+      }
+      else{
+        compare_dirs(src_path, dst_path, true, threshold);
+      }
     }
-
-    struct dirent *ent;
-    while ((ent = readdir(src_dir)) != NULL) {
-        if (strcmp(ent->d_name, ".") == 0 ||
-            strcmp(ent->d_name, "..") == 0) continue;
-
-        char src_path[PATH_MAX], dst_path[PATH_MAX];
-        snprintf(src_path, sizeof(src_path), "%s/%s", src, ent->d_name);
-        snprintf(dst_path, sizeof(dst_path), "%s/%s", dst, ent->d_name);
-
-        struct stat src_st;
-        if (lstat(src_path, &src_st) != 0) continue;
-
-        if (S_ISREG(src_st.st_mode)) {
-            struct stat dst_st;
-            bool dst_exists = (lstat(dst_path, &dst_st) == 0 &&
-                                S_ISREG(dst_st.st_mode));
-
-            if (!dst_exists) {
-                syslog(LOG_INFO, "New file: %s", src_path);
-                copy_file_smart(src_path, dst_path, threshold);
-            } else if (src_st.st_mtime > dst_st.st_mtime) {
-                syslog(LOG_INFO, "Updated file: %s", src_path);
-                copy_file_smart(src_path, dst_path, threshold);
-            }
-
-        } else if (S_ISDIR(src_st.st_mode) && recursive) {
-            struct stat dst_st;
-            if (lstat(dst_path, &dst_st) != 0) {
-                if (mkdir(dst_path, 0755) == 0)
-                    syslog(LOG_INFO, "Created dir: %s", dst_path);
-                else {
-                    syslog(LOG_ERR, "mkdir failed: %s", dst_path);
-                    continue;
-                }
-            }
-            compare_dirs(src_path, dst_path, true, threshold);
-        }
-    }
-    closedir(src_dir);
+  }
+  closedir(src_dir);
 }
 
 static void remove_extras(const char *src, const char *dst, bool recursive)
 {
-    DIR *dst_dir = opendir(dst);
-    if (!dst_dir) {
-        syslog(LOG_ERR, "Cannot open dest dir: %s", dst);
-        return;
-    }
+  DIR *dst_dir = opendir(dst);
+  if (!dst_dir) {
+    syslog(LOG_ERR, "Cannot open dest dir: %s", dst);
+    return;
+  }
 
-    struct dirent *ent;
-    while ((ent = readdir(dst_dir)) != NULL) {
-        if (strcmp(ent->d_name, ".") == 0 ||
-            strcmp(ent->d_name, "..") == 0) continue;
+  struct dirent *ent;
+  while ((ent = readdir(dst_dir)) != NULL) {
+    if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
 
-        char src_path[PATH_MAX], dst_path[PATH_MAX];
-        snprintf(src_path, sizeof(src_path), "%s/%s", src, ent->d_name);
-        snprintf(dst_path, sizeof(dst_path), "%s/%s", dst, ent->d_name);
+      char src_path[PATH_MAX], dst_path[PATH_MAX];
+      snprintf(src_path, sizeof(src_path), "%s/%s", src, ent->d_name);
+      snprintf(dst_path, sizeof(dst_path), "%s/%s", dst, ent->d_name);
 
-        struct stat src_st;
-        bool in_src = (lstat(src_path, &src_st) == 0);
+      struct stat src_st;
+      bool in_src = (lstat(src_path, &src_st) == 0);
 
-        struct stat dst_st;
-        if (lstat(dst_path, &dst_st) != 0) continue;
+      struct stat dst_st;
+      if (lstat(dst_path, &dst_st) != 0) continue;
 
-        if (S_ISREG(dst_st.st_mode)) {
-            if (!in_src || !S_ISREG(src_st.st_mode))
-                remove_file(dst_path);
-        } else if (S_ISDIR(dst_st.st_mode) && recursive) {
-            if (!in_src || !S_ISDIR(src_st.st_mode)) {
-                if (remove_directory(dst_path) == 0)
-                    syslog(LOG_INFO, "Removed dir: %s", dst_path);
-                else
-                    syslog(LOG_ERR, "Failed to remove dir: %s", dst_path);
-            } else {
-                remove_extras(src_path, dst_path, true);
-            }
+      if (S_ISREG(dst_st.st_mode)) {
+        if (!in_src || !S_ISREG(src_st.st_mode))
+          remove_file(dst_path);
+      } 
+      else if (S_ISDIR(dst_st.st_mode) && recursive){
+        if (!in_src || !S_ISDIR(src_st.st_mode)) {
+          if (remove_directory(dst_path) == 0)
+            syslog(LOG_INFO, "Removed dir: %s", dst_path);
+          else
+            syslog(LOG_ERR, "Failed to remove dir: %s", dst_path);
+          } 
+        else {
+          remove_extras(src_path, dst_path, true);
         }
-    }
-    closedir(dst_dir);
+      }
+  }
+  closedir(dst_dir);
 }
 
-void sync_dirs(const char *src, const char *dst,
-               bool recursive, off_t threshold)
+void sync_dirs(const char *src, const char *dst, bool recursive, off_t threshold)
 {
-    syslog(LOG_INFO, "Sync started: %s -> %s", src, dst);
-    remove_extras(src, dst, recursive);
-    compare_dirs(src, dst, recursive, threshold);
-    syslog(LOG_INFO, "Sync finished: %s -> %s", src, dst);
+  syslog(LOG_INFO, "Sync started: %s -> %s", src, dst);
+  remove_extras(src, dst, recursive);
+  compare_dirs(src, dst, recursive, threshold);
+  syslog(LOG_INFO, "Sync finished: %s -> %s", src, dst);
 }
 
 int main(int _argc, char** _argv){
@@ -444,9 +401,12 @@ int main(int _argc, char** _argv){
       tSleep = atoi(_argv[i]);
     }
     else if(_argv[i][1] == 'm'){
-       if(++i >= _argc){ pUse(); return -1; }
-          mmap_threshold = (off_t)atol(_argv[i]);
-       }
+      if(++i >= _argc){ 
+        pUse(); 
+        return -1; 
+      }
+        mmap_threshold = (off_t)atol(_argv[i]);
+    }
   }
   if(tSleep < 10) tSleep = 10;
   
